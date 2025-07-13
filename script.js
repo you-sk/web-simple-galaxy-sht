@@ -1,0 +1,325 @@
+// --- ゲームの初期設定 ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const invincibleToggle = document.getElementById('invincible-toggle');
+const muteToggle = document.getElementById('mute-toggle');
+
+// --- ゲーム内変数 ---
+let score = 0;
+let highScore = 0;
+let nextExtendScore = 20000;
+let stage = 1;
+let lives = 2;
+let gameState = 'waiting';
+let stageTimer = 0;
+let isInvincibleDebug = false;
+let soundEnabled = true;
+let audioStarted = false;
+
+// --- 自機の設定 ---
+const player = { x: 0, y: 0, width: 50, height: 30, speed: 5, dx: 0, state: 'active', respawnTimer: 0 };
+
+// --- 弾の設定 ---
+const bullets = [];
+const enemyBullets = [];
+const bulletSpeed = 8;
+const enemyBulletSpeed = 2;
+const laserSpeed = 10;
+let canShoot = true;
+let gruntFireCooldown = 60; 
+let midbossFireCooldown = 120;
+let bossFireCooldown = 180;
+
+// --- 敵の設定 ---
+const enemies = [];
+const enemyPadding = 15;
+const enemyRowHeight = 40;
+const maxAttackingGrunts = 3;
+let gruntLaunchTimer = 0;
+const gruntLaunchInterval = 120;
+
+// --- 敵編隊の動き ---
+let formationMoveTimer = 0;
+const formationMoveRange = canvas.width * 0.1;
+const formationMoveSpeed = 0.5;
+
+// --- エフェクト設定 ---
+const particles = [];
+const stars = [];
+const starCount = 200;
+const floatingScores = [];
+
+// --- キー入力管理 ---
+const keys = { right: false, left: false, space: false };
+
+// --- 効果音のセットアップ ---
+const playerShootSynth = new Tone.Synth({ oscillator: { type: 'square' }, envelope: { attack: 0.01, decay: 0.1, sustain: 0.2, release: 0.1 }, volume: -20 }).toDestination();
+const playerExplosionSynth = new Tone.NoiseSynth({ noise: { type: 'brown' }, envelope: { attack: 0.01, decay: 0.5, sustain: 0.1, release: 0.2 }, volume: -5 }).toDestination();
+const laserChargeSynth = new Tone.Synth({ oscillator: { type: 'sawtooth' }, envelope: { attack: 0.01, decay: 0.4, sustain: 0.1, release: 0.1}, volume: -15 }).toDestination();
+const laserFireSynth = new Tone.Synth({ oscillator: { type: 'fmsquare' }, envelope: { attack: 0.01, decay: 0.5, sustain: 0, release: 0.2 }, volume: -10 }).toDestination();
+const extendSynth = new Tone.Synth({ oscillator: { type: 'triangle' }, envelope: { attack: 0.01, decay: 0.1, sustain: 0.2, release: 0.2 }, volume: -10 }).toDestination();
+
+function playEnemyExplosion() {
+    if (!soundEnabled) return;
+    const synth = new Tone.NoiseSynth({ noise: { type: 'white' }, envelope: { attack: 0.01, decay: 0.2, sustain: 0, release: 0.1 }, volume: -15 }).toDestination();
+    synth.triggerAttackRelease('0.2', Tone.now());
+    setTimeout(() => synth.dispose(), 300);
+}
+function playRicochet() {
+    if (!soundEnabled) return;
+    const synth = new Tone.MetalSynth({ frequency: 400, envelope: { attack: 0.001, decay: 0.1, release: 0.01 }, harmonicity: 8.5, modulationIndex: 20, resonance: 4000, octaves: 1.5, volume: -15 }).toDestination();
+    synth.triggerAttackRelease('C7', '0.05', Tone.now());
+    setTimeout(() => synth.dispose(), 200);
+}
+function playBossHit() {
+    if (!soundEnabled) return;
+    const synth = new Tone.MembraneSynth({ pitchDecay: 0.08, octaves: 2, envelope: { attack: 0.01, decay: 0.3, sustain: 0.01, release: 0.1 }, volume: -10 }).toDestination();
+    synth.triggerAttackRelease('C2', '0.1', Tone.now());
+    setTimeout(() => synth.dispose(), 400);
+}
+ function playBulletCollision() {
+    if (!soundEnabled) return;
+    const synth = new Tone.MetalSynth({ frequency: 800, envelope: { attack: 0.001, decay: 0.05, release: 0.01 }, harmonicity: 5.1, modulationIndex: 10, resonance: 2000, octaves: 1, volume: -20 }).toDestination();
+    synth.triggerAttackRelease('A6', '0.05', Tone.now());
+    setTimeout(() => synth.dispose(), 100);
+}
+
+// --- スコア処理 ---
+function addScore(points, x, y) {
+    const oldScore = score;
+    score += points;
+    floatingScores.push({ text: `+${points}`, x: x, y: y, alpha: 1.0, timer: 60, isSpecial: false });
+    if (oldScore < nextExtendScore && score >= nextExtendScore) {
+        lives++;
+        nextExtendScore += 20000;
+        floatingScores.push({ text: '1UP!', x: canvas.width / 2, y: canvas.height / 2, alpha: 1.0, timer: 120, isSpecial: true });
+        if (soundEnabled) {
+            const now = Tone.now();
+            extendSynth.triggerAttackRelease('E5', '8n', now);
+            extendSynth.triggerAttackRelease('G5', '8n', now + 0.1);
+            extendSynth.triggerAttackRelease('C6', '8n', now + 0.2);
+        }
+    }
+}
+function checkHighScore() { if (score > highScore) { highScore = score; localStorage.setItem('galagaHighScore', highScore); } }
+
+// --- ステージ生成・リセット ---
+function createEnemyFormation() {
+    enemies.length = 0;
+    const bossInfo = { count: 4, width: 60, height: 25, y: 50 };
+    const bossOffsetLeft = (canvas.width - (bossInfo.count * (bossInfo.width + enemyPadding))) / 2 + enemyPadding / 2;
+    for(let i = 0; i < bossInfo.count; i++) { const baseX = i * (bossInfo.width + enemyPadding) + bossOffsetLeft; enemies.push({ type: 'boss', x: baseX, y: bossInfo.y, baseX: baseX, baseY: bossInfo.y, width: bossInfo.width, height: bossInfo.height, alive: true, hp: 5, maxHp: 5, hitTimer: 0, state: 'inFormation', isCharging: false, chargeTimer: 0 }); }
+    const midBossInfo = { count: 6, width: 50, height: 22, y: bossInfo.y + enemyRowHeight };
+    const midBossOffsetLeft = (canvas.width - (midBossInfo.count * (midBossInfo.width + enemyPadding))) / 2 + enemyPadding / 2;
+     for(let i = 0; i < midBossInfo.count; i++) { const baseX = i * (midBossInfo.width + enemyPadding) + midBossOffsetLeft; enemies.push({ type: 'midboss', x: baseX, y: midBossInfo.y, baseX: baseX, baseY: midBossInfo.y, width: midBossInfo.width, height: midBossInfo.height, alive: true, hp: 3, maxHp: 3, state: 'inFormation' }); }
+    const gruntInfo = { count: 8, width: 40, height: 20, y_start: midBossInfo.y + enemyRowHeight };
+    const gruntOffsetLeft = (canvas.width - (gruntInfo.count * (gruntInfo.width + enemyPadding))) / 2 + enemyPadding / 2;
+    const swaySpeedBase = 0.025; const swayWidthBase = canvas.width / 6;
+    for (let r = 0; r < 2; r++) { for(let c = 0; c < gruntInfo.count; c++) { const baseX = c * (gruntInfo.width + enemyPadding) + gruntOffsetLeft; const baseY = gruntInfo.y_start + (r * enemyRowHeight); enemies.push({ type: 'grunt', x: baseX, y: baseY, baseX: baseX, baseY: baseY, width: gruntInfo.width, height: gruntInfo.height, alive: true, hp: 1, maxHp: 1, state: 'inFormation', diveTimer: 0, swaySpeed: swaySpeedBase * (0.7 + Math.random() * 0.6), swayWidth: swayWidthBase * (0.7 + Math.random() * 0.6) }); } }
+}
+function resetAfterHit() {
+    enemies.forEach(e => { if (e.alive && e.state === 'attacking') e.state = 'inFormation'; });
+    player.x = canvas.width / 2 - 25; player.y = canvas.height - 60;
+    player.state = 'respawning'; player.respawnTimer = 180;
+    bullets.length = 0; enemyBullets.length = 0;
+    gruntFireCooldown = 60; midbossFireCooldown = 120; bossFireCooldown = 180;
+    // タイマーリセット (新しいロジック)
+    const timeLimit = Math.max(25, 60 - (stage - 1) * 5);
+    stageTimer = timeLimit * 60;
+}
+function init() { highScore = localStorage.getItem('galagaHighScore') || 0; for (let i = 0; i < starCount; i++) { stars.push({ x: Math.random() * canvas.width, y: Math.random() * canvas.height, radius: Math.random() * 1.5 + 0.5, speed: Math.random() * 0.4 + 0.1 }); } gameLoop(); }
+
+// --- 描画関連 ---
+function drawUI() {
+    ctx.fillStyle = 'white'; ctx.font = '24px "Courier New", Courier, monospace'; 
+    ctx.textAlign = 'left'; ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.textAlign = 'center'; ctx.fillText(`HI-SCORE: ${highScore}`, canvas.width / 2, 30);
+    
+    ctx.textAlign = 'left';
+    ctx.fillText(`STAGE: ${stage}`, 20, canvas.height - 20);
+
+    const seconds = (stageTimer / 60).toFixed(2);
+    const timerColor = stageTimer <= 300 ? 'red' : 'white';
+    ctx.fillStyle = timerColor;
+    ctx.font = '24px "Courier New", Courier, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`TIME: ${seconds}`, canvas.width - 20, 30);
+    ctx.fillStyle = 'white';
+
+
+    if (gameState !== 'gameOver') { for (let i = 0; i < lives; i++) { const shipWidth = 30; const shipHeight = 18; const shipX = canvas.width - 40 - (i * (shipWidth + 10)); const shipY = canvas.height - 30; ctx.fillStyle = '#00ff00'; ctx.beginPath(); ctx.moveTo(shipX + shipWidth / 2, shipY); ctx.lineTo(shipX, shipY + shipHeight); ctx.lineTo(shipX + shipWidth, shipY + shipHeight); ctx.closePath(); ctx.fill(); } }
+    ctx.textAlign = 'center';
+    if (gameState === 'waiting') { ctx.font = '50px "Courier New", Courier, monospace'; ctx.fillText('GAME START', canvas.width / 2, canvas.height / 2 - 30); ctx.font = '20px "Courier New", Courier, monospace'; ctx.fillText('CLICK or PRESS SPACE to START', canvas.width / 2, canvas.height / 2 + 20); } 
+    else if (gameState === 'stageStarting') { ctx.font = '50px "Courier New", Courier, monospace'; ctx.fillText(`STAGE ${stage} START !`, canvas.width / 2, canvas.height / 2); }
+    else if (gameState === 'cleared') { ctx.font = '50px "Courier New", Courier, monospace'; ctx.fillText('STAGE CLEAR!', canvas.width / 2, canvas.height / 2 - 30); ctx.font = '20px "Courier New", Courier, monospace'; ctx.fillText('CLICK or PRESS SPACE for NEXT STAGE', canvas.width / 2, canvas.height / 2 + 20); }
+    else if (gameState === 'gameOver') { ctx.font = '60px "Courier New", Courier, monospace'; ctx.fillStyle = '#ff3333'; ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 40); ctx.font = '30px "Courier New", Courier, monospace'; ctx.fillStyle = 'white'; ctx.fillText(`FINAL SCORE: ${score}`, canvas.width / 2, canvas.height / 2 + 10); ctx.font = '20px "Courier New", Courier, monospace'; ctx.fillText('CLICK or PRESS SPACE to REPLAY', canvas.width / 2, canvas.height / 2 + 60); }
+}
+function drawPlayer() { if (player.state === 'active') { ctx.fillStyle = '#00ff00'; ctx.beginPath(); ctx.moveTo(player.x + player.width / 2, player.y); ctx.lineTo(player.x, player.y + player.height); ctx.lineTo(player.x + player.width, player.y + player.height); ctx.closePath(); ctx.fill(); } else if (player.state === 'respawning') { if (player.respawnTimer % 20 < 10) { ctx.fillStyle = '#00ff00'; ctx.beginPath(); ctx.moveTo(player.x + player.width / 2, player.y); ctx.lineTo(player.x, player.y + player.height); ctx.lineTo(player.x + player.width, player.y + player.height); ctx.closePath(); ctx.fill(); } } }
+function drawBullets() { ctx.fillStyle = '#ffcc00'; bullets.forEach(bullet => ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height)); }
+function drawEnemyBullets() { enemyBullets.forEach(bullet => { if (bullet.type === 'grunt') { ctx.fillStyle = '#00FFFF'; ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height); } else if (bullet.type === 'midboss') { ctx.fillStyle = '#FF88FF'; ctx.beginPath(); ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2); ctx.fill(); } else if (bullet.type === 'bossLaser') { if (Math.floor(Date.now() / 100) % 2 === 0) { ctx.fillStyle = '#FF55FF'; ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height); } } }); }
+function drawEnemies() { const isBossVulnerable = areSubEnemiesDefeated(); enemies.forEach(enemy => { if (enemy.alive) { ctx.beginPath(); switch(enemy.type) { case 'boss': if (enemy.isCharging && Math.floor(Date.now() / 80) % 2 === 0) { ctx.fillStyle = '#FFFFFF'; } else if (enemy.hitTimer > 0) { ctx.fillStyle = '#ffffff'; } else { ctx.fillStyle = isBossVulnerable ? '#ff66ff' : '#cc33ff'; } ctx.moveTo(enemy.x, enemy.y); ctx.lineTo(enemy.x + enemy.width, enemy.y); ctx.lineTo(enemy.x + enemy.width * 0.8, enemy.y + enemy.height); ctx.lineTo(enemy.x + enemy.width * 0.2, enemy.y + enemy.height); if (!isBossVulnerable && !enemy.isCharging) { ctx.strokeStyle = 'rgba(100, 100, 255, 0.8)'; ctx.lineWidth = 3; ctx.stroke(); } break; case 'midboss': if (enemy.hp === 3) ctx.fillStyle = '#3399ff'; else if (enemy.hp === 2) ctx.fillStyle = '#ffff33'; else ctx.fillStyle = '#ff9933'; ctx.moveTo(enemy.x + enemy.width / 2, enemy.y); ctx.lineTo(enemy.x + enemy.width, enemy.y + enemy.height * 0.7); ctx.lineTo(enemy.x + enemy.width / 2, enemy.y + enemy.height); ctx.lineTo(enemy.x, enemy.y + enemy.height * 0.7); break; case 'grunt': default: ctx.fillStyle = '#ff3333'; ctx.moveTo(enemy.x + enemy.width / 2, enemy.y + enemy.height); ctx.lineTo(enemy.x, enemy.y); ctx.lineTo(enemy.x + enemy.width, enemy.y); break; } ctx.closePath(); ctx.fill(); } }); }
+function drawStars() { ctx.fillStyle = '#777'; stars.forEach(star => { ctx.beginPath(); ctx.arc(star.x, star.y, star.radius, 0, Math.PI * 2); ctx.fill(); }); }
+function drawParticles() { particles.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fillStyle = p.color.replace(')', `, ${p.alpha})`); ctx.fill(); }); }
+function drawFloatingScores() { ctx.textAlign = 'center'; floatingScores.forEach(s => { if (s.isSpecial) { ctx.font = 'bold 24px "Courier New", Courier, monospace'; ctx.fillStyle = `rgba(100, 255, 100, ${s.alpha})`; } else { ctx.font = 'bold 20px "Courier New", Courier, monospace'; ctx.fillStyle = `rgba(255, 255, 100, ${s.alpha})`; } ctx.fillText(s.text, s.x, s.y); }); }
+
+// --- 更新関連 ---
+function updatePlayer() { if (player.state === 'respawning') { player.respawnTimer--; if (player.respawnTimer <= 0) player.state = 'active'; } if (player.state !== 'exploding') { if (keys.right) player.dx = player.speed; else if (keys.left) player.dx = -player.speed; else player.dx = 0; player.x += player.dx; if (player.x < 0) player.x = 0; if (player.x + player.width > canvas.width) player.x = canvas.width - player.width; } }
+function updateBullets() {
+    if (keys.space && canShoot && player.state !== 'exploding') {
+        const startX = player.x + player.width / 2 - 2.5;
+        bullets.push({ x: startX, y: player.y, width: 5, height: 10, dx: 0, dy: -bulletSpeed });
+        bullets.push({ x: startX, y: player.y, width: 5, height: 10, dx: -2, dy: -bulletSpeed });
+        bullets.push({ x: startX, y: player.y, width: 5, height: 10, dx: 2, dy: -bulletSpeed });
+        canShoot = false; if(soundEnabled) playerShootSynth.triggerAttackRelease('G5', '0.05');
+        setTimeout(() => { canShoot = true; }, 250);
+    }
+    for (let i = bullets.length - 1; i >= 0; i--) { const bullet = bullets[i]; bullet.x += bullet.dx; bullet.y += bullet.dy; if (bullet.y < -10 || bullet.x < 0 || bullet.x > canvas.width) bullets.splice(i, 1); }
+}
+function updateEnemyBullets() { for (let i = enemyBullets.length - 1; i >= 0; i--) { const bullet = enemyBullets[i]; if (bullet.type === 'grunt') bullet.y += enemyBulletSpeed; else if (bullet.type === 'midboss') { bullet.x += bullet.dx; bullet.y += bullet.dy; } else if (bullet.type === 'bossLaser') bullet.y += laserSpeed; if (bullet.y > canvas.height || bullet.y < -bullet.height || bullet.x < 0 || bullet.x > canvas.width) enemyBullets.splice(i, 1); } }
+function updateEnemies() {
+    gruntLaunchTimer++;
+    if (gruntLaunchTimer > gruntLaunchInterval && enemies.filter(e => e.alive && e.type === 'grunt' && e.state === 'attacking').length < maxAttackingGrunts) { const available = enemies.filter(e => e.alive && e.type === 'grunt' && e.state === 'inFormation'); if (available.length > 0) { const random = available[Math.floor(Math.random() * available.length)]; random.state = 'attacking'; random.diveTimer = 0; gruntLaunchTimer = 0; } }
+    formationMoveTimer += 0.01 * formationMoveSpeed; const formationOffsetX = Math.sin(formationMoveTimer) * formationMoveRange;
+    enemies.forEach(enemy => { if (!enemy.alive) return; if (enemy.isCharging) { enemy.chargeTimer--; if (enemy.chargeTimer <= 0) { enemy.isCharging = false; enemyBullets.push({ type: 'bossLaser', x: enemy.x + enemy.width / 2 - 3, y: enemy.y + enemy.height, width: 6, height: canvas.height }); if(soundEnabled) laserFireSynth.triggerAttackRelease('G3', '0.4'); } } if (enemy.state === 'inFormation') { enemy.x = enemy.baseX + formationOffsetX; enemy.y = enemy.baseY; } else if (enemy.state === 'attacking') { enemy.diveTimer++; enemy.y += 2; enemy.x = enemy.baseX + Math.sin(enemy.diveTimer * enemy.swaySpeed) * enemy.swayWidth; if (enemy.y > canvas.height) { enemy.y = -enemy.height; enemy.x = enemy.baseX; enemy.diveTimer = 0; } } if (enemy.hitTimer > 0) enemy.hitTimer--; });
+    
+    gruntFireCooldown--;
+    if (gruntFireCooldown <= 0 && enemyBullets.filter(b => b.type === 'grunt').length < 3) { const shooters = enemies.filter(e => e.alive && e.type === 'grunt' && e.state === 'inFormation'); if (shooters.length > 0) { const shooter = shooters[Math.floor(Math.random() * shooters.length)]; enemyBullets.push({ type: 'grunt', x: shooter.x + shooter.width / 2 - 2, y: shooter.y + shooter.height, width: 4, height: 10 }); gruntFireCooldown = Math.random() * 45 + 45; } }
+    
+    midbossFireCooldown--;
+    const gruntsInFormation = enemies.some(e => e.alive && e.type === 'grunt' && e.state === 'inFormation');
+    const maxMidbossBullets = gruntsInFormation ? 1 : 3;
+    if (midbossFireCooldown <= 0 && enemyBullets.filter(b => b.type === 'midboss').length < maxMidbossBullets) { const shooters = enemies.filter(e => e.alive && e.type === 'midboss' && e.state === 'inFormation'); if (shooters.length > 0) { const shooter = shooters[Math.floor(Math.random() * shooters.length)]; const angle = Math.atan2((player.y + player.height / 2) - (shooter.y + shooter.height / 2), (player.x + player.width / 2) - (shooter.x + shooter.width / 2)); enemyBullets.push({ type: 'midboss', x: shooter.x + shooter.width / 2, y: shooter.y + shooter.height / 2, radius: 6, dx: Math.cos(angle) * enemyBulletSpeed, dy: Math.sin(angle) * enemyBulletSpeed }); midbossFireCooldown = Math.random() * 60 + 90; } }
+
+    bossFireCooldown--;
+    const areAllGruntsGone = !enemies.some(e => e.alive && e.type === 'grunt');
+    if (bossFireCooldown <= 0 && areAllGruntsGone && !enemyBullets.some(b => b.type === 'bossLaser')) {
+        const shooters = enemies.filter(e => e.alive && e.type === 'boss' && !e.isCharging);
+        if (shooters.length > 0) {
+            const shooter = shooters[Math.floor(Math.random() * shooters.length)];
+            shooter.isCharging = true; shooter.chargeTimer = 30;
+            if(soundEnabled) laserChargeSynth.triggerAttackRelease('C3', '0.5');
+            const isVulnerable = areSubEnemiesDefeated();
+            bossFireCooldown = isVulnerable ? (Math.random() * 30 + 15) : (Math.random() * 60 + 120);
+        }
+    }
+}
+function updateStars() { stars.forEach(star => { star.y += star.speed; if (star.y > canvas.height) { star.x = Math.random() * canvas.width; star.y = 0 - star.radius; } }); }
+function updateParticles() { for (let i = particles.length - 1; i >= 0; i--) { const p = particles[i]; p.x += p.vx; p.y += p.vy; p.alpha -= 0.02; if (p.alpha <= 0) particles.splice(i, 1); } }
+function updateFloatingScores() { for(let i = floatingScores.length - 1; i >= 0; i--) { const s = floatingScores[i]; s.y -= 0.8; s.timer--; s.alpha = s.timer / 60; if (s.timer <= 0) floatingScores.splice(i, 1); } }
+function areSubEnemiesDefeated() { return !enemies.some(e => e.alive && (e.type === 'grunt' || e.type === 'midboss')); }
+
+function checkCollisions() {
+    const isBossVulnerable = areSubEnemiesDefeated(); for (let i = bullets.length - 1; i >= 0; i--) { const bullet = bullets[i]; if (!bullet) continue; for (let j = enemies.length - 1; j >= 0; j--) { const enemy = enemies[j]; if (enemy.alive && bullet.x < enemy.x + enemy.width && bullet.x + bullet.width > enemy.x && bullet.y < enemy.y + enemy.height && bullet.y + bullet.height > enemy.y) { if (enemy.type === 'boss' && !isBossVulnerable) { playRicochet(); createRicochetEffect(bullet.x, bullet.y); } else { enemy.hp--; if (enemy.type === 'boss') { enemy.hitTimer = 5; playBossHit(); } if (enemy.hp > 0) { if(enemy.type === 'boss') addScore(100, bullet.x, enemy.y + enemy.height / 2); else createDamageEffect(bullet.x, bullet.y); } else { enemy.alive = false; playEnemyExplosion(); createExplosion(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2); let points = 0; if (enemy.type === 'grunt') points = enemy.state === 'attacking' ? 200 : 100; else if (enemy.type === 'midboss') points = 300; else if (enemy.type === 'boss') points = 500; addScore(points, enemy.x + enemy.width / 2, enemy.y + enemy.height / 2); } } bullets.splice(i, 1); break; } } }
+    if (player.state === 'active' && !isInvincibleDebug) {
+        enemies.forEach(enemy => { if (enemy.alive && enemy.state === 'attacking') { if (player.x < enemy.x + enemy.width && player.x + player.width > enemy.x && player.y < enemy.y + enemy.height && player.y + player.height > enemy.y) { handlePlayerHit('collision'); } } });
+        for (let i = enemyBullets.length - 1; i >= 0; i--) {
+            const eb = enemyBullets[i]; let hit = false;
+            if (eb.type === 'grunt' || eb.type === 'bossLaser') { hit = player.x < eb.x + eb.width && player.x + player.width > eb.x && player.y < eb.y + eb.height && player.y + player.height > eb.y; }
+            else if (eb.type === 'midboss') { const dx = eb.x - (player.x + player.width / 2); const dy = eb.y - (player.y + player.height / 2); const dist = Math.sqrt(dx * dx + dy * dy); hit = dist < eb.radius + player.width / 2.5; }
+            if (hit) { if(eb.type !== 'bossLaser') enemyBullets.splice(i, 1); handlePlayerHit('collision'); break; }
+        }
+    }
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        for (let j = enemyBullets.length - 1; j >= 0; j--) {
+            const pb = bullets[i]; const eb = enemyBullets[j];
+            if (pb && eb) {
+                let hit = false;
+                if (eb.type === 'grunt') { hit = pb.x < eb.x + eb.width && pb.x + pb.width > eb.x && pb.y < eb.y + eb.height && pb.y + eb.height > pb.y; }
+                else if (eb.type === 'midboss') { hit = Math.sqrt(Math.pow(pb.x + pb.width/2 - eb.x, 2) + Math.pow(pb.y - eb.y, 2)) < eb.radius; }
+                else if (eb.type === 'bossLaser') { hit = pb.x < eb.x + eb.width && pb.x + pb.width > eb.x && pb.y < eb.y + eb.height && pb.y + eb.height > pb.y; }
+                if(hit){
+                    if(eb.type === 'grunt'){ playBulletCollision(); createBulletCollisionEffect((pb.x + eb.x)/2, (pb.y + eb.y)/2); bullets.splice(i, 1); enemyBullets.splice(j, 1); } 
+                    else if(eb.type === 'midboss' || eb.type === 'bossLaser'){ playRicochet(); createRicochetEffect(pb.x, pb.y); bullets.splice(i, 1); }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+function handlePlayerHit(cause) {
+    if (gameState !== 'playing') return;
+    if (cause === 'collision' && isInvincibleDebug) return;
+
+    player.state = 'exploding'; gameState = 'exploding';
+    if(soundEnabled) playerExplosionSynth.triggerAttackRelease('0.4');
+    createExplosion(player.x + player.width / 2, player.y + player.height / 2);
+    
+    if (cause === 'collision' || (cause === 'timeover' && !isInvincibleDebug)) {
+        lives--;
+    }
+
+    setTimeout(() => { if (lives < 0) { checkHighScore(); gameState = 'gameOver'; } else { gameState = 'stageStarting'; setTimeout(() => { resetAfterHit(); gameState = 'playing'; }, 1200); } }, 2000);
+}
+
+function checkGameStatus() { if (enemies.length > 0 && !enemies.some(e => e.alive)) { checkHighScore(); gameState = 'cleared'; } }
+
+function createExplosion(x, y) { for (let i = 0; i < 40; i++) { const angle = Math.random() * Math.PI * 2, speed = Math.random() * 5 + 1; particles.push({ x: x, y: y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, size: Math.random() * 3 + 1, alpha: 1, color: 'rgba(255, 255, 255' }); } }
+function createDamageEffect(x, y) { for (let i = 0; i < 5; i++) { const angle = Math.random() * Math.PI * 2, speed = Math.random() * 1.5 + 0.5; particles.push({ x: x, y: y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, size: Math.random() * 1.5 + 1, alpha: 1, color: 'rgba(255, 200, 0' }); } }
+function createRicochetEffect(x, y) { for (let i = 0; i < 8; i++) { const angle = -Math.PI / 2 + (Math.random() - 0.5) * (Math.PI / 2), speed = Math.random() * 2 + 1; particles.push({ x: x, y: y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, size: Math.random() * 2 + 1, alpha: 1, color: 'rgba(150, 200, 255' }); } }
+function createBulletCollisionEffect(x, y) { for (let i = 0; i < 5; i++) { const angle = Math.random() * Math.PI * 2, speed = Math.random() * 1; particles.push({ x: x, y: y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, size: Math.random() * 1.5 + 1, alpha: 1, color: 'rgba(200, 200, 255' }); } }
+
+function handleUserAction() { 
+    if (audioStarted === false) { Tone.start(); audioStarted = true; }
+    if (gameState === 'waiting' || gameState === 'gameOver' || gameState === 'cleared') {
+        if (gameState === 'gameOver' || gameState === 'waiting') { score = 0; stage = 1; lives = 2; nextExtendScore = 20000; }
+        if (gameState === 'cleared') stage++;
+        gameState = 'stageStarting'; 
+        setTimeout(() => {
+            createEnemyFormation();
+            resetAfterHit();
+            gameState = 'playing';
+        }, 1200);
+    }
+}
+function keyDown(e) { if (e.key === 'ArrowRight' || e.key === 'Right') keys.right = true; else if (e.key === 'ArrowLeft' || e.key === 'Left') keys.left = true; if (e.key === ' ' || e.code === 'Space') { if (gameState === 'playing') keys.space = true; else if (gameState === 'waiting' || gameState === 'cleared' || gameState === 'gameOver') handleUserAction(); } }
+function keyUp(e) { if (e.key === 'ArrowRight' || e.key === 'Right') keys.right = false; else if (e.key === 'ArrowLeft' || e.key === 'Left') keys.left = false; if (e.key === ' ' || e.code === 'Space') keys.space = false; }
+document.addEventListener('keydown', keyDown);
+document.addEventListener('keyup', keyUp);
+canvas.addEventListener('click', () => { if (gameState === 'waiting' || gameState === 'cleared' || gameState === 'gameOver') handleUserAction(); });
+invincibleToggle.addEventListener('change', (e) => { isInvincibleDebug = e.target.checked; });
+muteToggle.addEventListener('change', (e) => { soundEnabled = !e.target.checked; });
+
+function update() {
+    updateStars();
+    updateParticles();
+    updateFloatingScores();
+    if (gameState === 'stageStarting' || gameState === 'exploding') return;
+    if (gameState !== 'playing') return;
+    updatePlayer();
+    updateBullets();
+    updateEnemyBullets();
+    updateEnemies();
+    checkCollisions();
+    checkGameStatus();
+    
+    if (stageTimer > 0) {
+        stageTimer--;
+    } else if (gameState === 'playing') {
+        handlePlayerHit('timeover');
+    }
+}
+function draw() {
+    const timeLeft = stageTimer / 60;
+    canvas.style.borderColor = (timeLeft <= 5 && gameState === 'playing' && Math.floor(Date.now() / 200) % 2 === 0) ? '#ff3333' : '#fff';
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawStars();
+    if (gameState === 'playing' || player.state === 'respawning' ) {
+        drawPlayer();
+    }
+    if(gameState === 'playing' || gameState === 'cleared' || gameState === 'exploding') {
+         drawEnemies();
+         drawBullets();
+         drawEnemyBullets();
+    }
+    drawParticles();
+    drawFloatingScores();
+    drawUI();
+}
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+init();
